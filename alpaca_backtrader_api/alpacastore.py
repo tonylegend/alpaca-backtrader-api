@@ -9,7 +9,7 @@ import traceback
 from datetime import datetime, timedelta, time as dtime
 from dateutil.parser import parse as date_parse
 import time as _time
-import trading_calendars
+import exchange_calendars
 import threading
 import asyncio
 
@@ -444,8 +444,8 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
             dtend = pd.Timestamp(pytz.timezone('UTC').localize(dtend)) if \
               not dtend.tzname() else dtend
         if granularity == Granularity.Minute:
-            calendar = trading_calendars.get_calendar(name='NYSE')
-            while not calendar.is_open_on_minute(dtend):
+            calendar = exchange_calendars.get_calendar(name='NYSE')
+            while not calendar.is_open_on_minute(dtend.ceil(freq='T')):
                 dtend = dtend.replace(hour=15,
                                       minute=59,
                                       second=0,
