@@ -336,6 +336,7 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
     def _t_streaming_listener(self, q, tmout=None):
         while True:
             trans = q.get()
+            print(f"The new transaction message: {trans}")
             self._transaction(trans.order)
 
     def _t_streaming_events(self, q, tmout=None):
@@ -743,13 +744,17 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         def _check_if_transaction_occurred(order_id):
             # a transaction may have happened and was stored. if so let's
             # process it
+            print(">>>> check if transaction occurred")
+            print(f">>>> Current pending transactions: {self._transpend.keys()}")
             tpending = self._transpend[order_id]
             tpending.append(None)  # eom marker
+            print(f">>>> The pending transactions for order id {order_id}: {tpending}")
             while True:
                 trans = tpending.popleft()
                 if trans is None:
                     break
                 self._process_transaction(order_id, trans)
+            print(f">>>> The pending transactions after checking: {self._transpend.keys()}")
 
         while True:
             try:
@@ -759,6 +764,7 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
                 if msg is None:
                     continue
                 oref, okwargs = msg
+                print(f">>>> Create oref {oref} okwargs {okwargs}")
                 try:
                     o = self.oapi.submit_order(**okwargs)
                 except Exception as e:
@@ -778,21 +784,25 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
                     self.broker._reject(oref)
                     continue
 
-                if okwargs['type'] == 'market':
-                    self.broker._accept(oref)  # taken immediately
-
                 self._orders[oref] = oid
                 self._ordersrev[oid] = oref  # maps ids to backtrader order
+                self.broker._submit(oref)
+                # if okwargs['type'] == 'market':
+                #     print(f">>>> Immediately accept the market order {oid}")
+                #     self.broker._accept(oref)  # taken immediately
+
                 _check_if_transaction_occurred(oid)
                 if o.legs:
+                    print(f">>>> Process leg orders {o.legs}.")
                     index = 1
                     for leg in o.legs:
                         self._orders[oref + index] = leg.id
                         self._ordersrev[leg.id] = oref + index
                         _check_if_transaction_occurred(leg.id)
-                self.broker._submit(oref)  # inside it submits the legs too
-                if okwargs['type'] == 'market':
-                    self.broker._accept(oref)  # taken immediately
+                    self.broker._submit(oref)  # inside it submits the legs too
+                    if okwargs['type'] == 'market':
+                        print(f">>>> Immediately accept the market order {oid}")
+                        self.broker._accept(oref)  # taken immediately
 
             except Exception as e:
                 print(str(e))
@@ -832,32 +842,60 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         # oid which has not yet been returned after creating an order. Hence
         # store if not yet seen, else forward to processer
 
+        print(f">>>>>>> Received the transaction response: {trans}")
+        print(f">>>> Current pending transactions: {self._transpend.keys()}")
+        print(f"current status: {trans['status']}")
         oid = trans['id']
 
-        if not self._ordersrev.get(oid, False):
+        try:
+            oref = self._ordersrev[oid]
+            print(f"order {oid} was created. let's process it.")
+            self._process_transaction(oid, trans)
+        except KeyError:
+            print(f"order {oid} has not yet created, let's store it in the pending order list and process it in the order create session.")
             self._transpend[oid].append(trans)
-        self._process_transaction(oid, trans)
+
+        # if not self._ordersrev.get(oid, False):
+        #     print(f"order id {oid} has not yet seen, let's store it.")
+        #     self._transpend[oid].append(trans)
+        # else:
+        #     print(f"process oid {oid}")
+        #     self._process_transaction(oid, trans)
 
     _X_ORDER_FILLED = ('partially_filled', 'filled',)
 
     def _process_transaction(self, oid, trans):
+        print(f">>>> Start processing the transaction for order id {oid}.")
+        print(f">>>> Current pending orders: {self._ordersrev}")
         try:
             oref = self._ordersrev.pop(oid)
+            order = self.broker.orders[oref]
         except KeyError:
+            print(f">>>> the order id {oid} has not been created yet. skip the processing.")
             return
+        print(f">>>> Current pending orders after popping: {self._ordersrev}")
 
         ttype = trans['status']
 
         if ttype in self._X_ORDER_FILLED:
-            size = float(trans['filled_qty'])
+            print(">>>> process the order execution in _process_transaction.")
+            # size = float(trans['filled_qty'])
+            if ttype == 'partially_filled':
+                self._ordersrev[oid] = oref
+                print(f">>>> Add back the pending order for the possible further exbits: {self._ordersrev}")
+                size = float(trans['filled_qty'])
+            else:
+                size = order.executed.remsize  # Alpaca sends the total quantity when the order is complete and only the remaining size will be filled.
             if trans['side'] == 'sell':
                 size = -size
-            price = float(trans['filled_avg_price'])
+            price = float(trans['filled_avg_price'])  # Todo: to check with Alpaca if the filled price is the executed price of the last exbit.
             self.broker._fill(oref, size, price, ttype=ttype)
 
         elif ttype in self._X_ORDER_CREATE:
-            self.broker._accept(oref)
+            print(">>>> process the order accept in _process_transaction.")
             self._ordersrev[oid] = oref
+            print(f">>>> Add back the pending order for further processing: {self._ordersrev}")
+            self.broker._accept(oref)
 
         elif ttype == 'calculated':
             return
@@ -867,3 +905,5 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         else:  # default action ... if nothing else
             print("Process transaction - Order type: {}".format(ttype))
             self.broker._reject(oref)
+
+        print(f">>>> the pending orders after processing this transaction: {self._ordersrev}")
