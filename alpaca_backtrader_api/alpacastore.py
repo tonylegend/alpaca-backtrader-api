@@ -884,10 +884,10 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
                 self._ordersrev[oid] = oref
                 print(f">>>> Add back the pending order for the possible further exbits: {self._ordersrev}")
                 size = float(trans['filled_qty'])
+                if trans['side'] == 'sell':
+                    size = -size
             else:
                 size = order.executed.remsize  # Alpaca sends the total quantity when the order is complete and only the remaining size will be filled.
-            if trans['side'] == 'sell':
-                size = -size
             price = float(trans['filled_avg_price'])  # Todo: to check with Alpaca if the filled price is the executed price of the last exbit.
             self.broker._fill(oref, size, price, ttype=ttype)
 
