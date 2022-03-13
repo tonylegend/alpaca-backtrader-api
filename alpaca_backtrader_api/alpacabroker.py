@@ -7,6 +7,7 @@ from backtrader import BrokerBase, Order, BuyOrder, SellOrder
 from backtrader.utils.py3 import with_metaclass, iteritems
 from backtrader.comminfo import CommInfoBase
 from backtrader.position import Position
+import backtrader as bt
 
 from alpaca_backtrader_api import alpacastore
 
@@ -244,25 +245,77 @@ class AlpacaBroker(with_metaclass(MetaAlpacaBroker, BrokerBase)):
         order = self.orders[oref]
         data = order.data
         pos = self.getposition(data, clone=False)
-        psize, pprice, opened, closed = pos.update(size, price)
+        pprice_orig = pos.price
+        # psize, pprice, opened, closed = pos.update(size, price)
+        psize, pprice, opened, closed = pos.pseudoupdate(size, price)
 
-        closedvalue = closedcomm = 0.0
-        openedvalue = openedcomm = 0.0
-        margin = pnl = 0.0
+        # Get comminfo object for the order
+        comminfo = order.comminfo
+        if comminfo is None:
+            raise ValueError(f"No comminfo {comminfo}.")
 
-        order.execute(data.datetime[0], size, price,
-                      closed, closedvalue, closedcomm,
-                      opened, openedvalue, openedcomm,
-                      margin, pnl,
-                      psize, pprice)
+        # if part/all of a position has been closed, then there has been
+        # a profitandloss ... record it
+        pnl = comminfo.profitandloss(-closed, pprice_orig, price)
 
-        if order.executed.remsize:
-            order.partial()
-            self.notify(order)
+        if closed:
+            # Adjust to returned value for closed items & acquired opened items
+            closedvalue = comminfo.getoperationcost(closed, pprice_orig)
+            # Calculate and substract commission
+            closedcomm = comminfo.getcommission(closed, price)
         else:
-            order.completed()
-            self.notify(order)
-            self._bracketize(order)
+            closedvalue = closedcomm = 0.0
+
+        if opened:
+            openedvalue = comminfo.getoperationcost(opened, price)
+            openedcomm = comminfo.getcommission(opened, price)
+            # record adjust price base for end of bar cash adjustment
+            pos.adjbase = price
+        else:
+            openedvalue = openedcomm = 0.0
+
+        # closedvalue = closedcomm = 0.0
+        # openedvalue = openedcomm = 0.0
+        # margin = pnl = 0.0
+        margin = 0.0
+
+        execsize = closed + opened
+        if execsize:
+            # Confirm the operation to the comminfo object
+            comminfo.confirmexec(execsize, price)
+            # do a real position update if something was executed
+            # print(f">>>> data datetime {bt.num2date(data.datetime[0])}")
+            # print(f">>>> data datetime when filled: {data.datetime[0]}")
+            # pos.update(execsize, price, bt.num2date(data.datetime[0]))
+            pos.update(execsize, price, data.datetime[0])
+            # Execute and notify the order
+            order.execute(data.datetime[0], execsize, price,
+                          closed, closedvalue, closedcomm,
+                          opened, openedvalue, openedcomm,
+                          margin, pnl,
+                          psize, pprice)
+            order.addcomminfo(comminfo)
+            if order.executed.remsize:
+                order.partial()
+                self.notify(order)
+            else:
+                order.completed()
+                self.notify(order)
+                self._bracketize(order)
+
+        # order.execute(data.datetime[0], size, price,
+        #               closed, closedvalue, closedcomm,
+        #               opened, openedvalue, openedcomm,
+        #               margin, pnl,
+        #               psize, pprice)
+        #
+        # if order.executed.remsize:
+        #     order.partial()
+        #     self.notify(order)
+        # else:
+        #     order.completed()
+        #     self.notify(order)
+        #     self._bracketize(order)
 
     def _transmit(self, order):
         oref = order.ref
@@ -331,7 +384,8 @@ class AlpacaBroker(with_metaclass(MetaAlpacaBroker, BrokerBase)):
         return self.o.order_cancel(order)
 
     def notify(self, order):
-        self.positions = self.update_positions()
+        # The positions should be updated at start only, otherwise there will exist the conflicts when updating postions on both server and client sides.
+        # self.positions = self.update_positions()
         self.notifs.append(order.clone())
 
     def get_notification(self):

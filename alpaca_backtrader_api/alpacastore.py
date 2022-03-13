@@ -234,6 +234,7 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         self._orders = collections.OrderedDict()  # map order.ref to oid
         self._ordersrev = collections.OrderedDict()  # map oid to order.ref
         self._transpend = collections.defaultdict(collections.deque)
+        self._orderexecs = collections.defaultdict(list)  # map oid to order executions
 
         if self.p.paper:
             self._oenv = self._ENVPRACTICE
@@ -336,8 +337,9 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
     def _t_streaming_listener(self, q, tmout=None):
         while True:
             trans = q.get()
-            print(f"The new transaction message: {trans}")
-            self._transaction(trans.order)
+            # print(f"The new transaction message: {trans}")
+            # self._transaction(trans.order)
+            self._transaction(trans)
 
     def _t_streaming_events(self, q, tmout=None):
         if tmout is not None:
@@ -844,8 +846,15 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
 
         print(f">>>>>>> Received the transaction response: {trans}")
         print(f">>>> Current pending transactions: {self._transpend.keys()}")
-        print(f"current status: {trans['status']}")
-        oid = trans['id']
+        print(f"current status: {trans.order['status']}")
+        # oid = trans['id']
+        oid = trans.order['id']
+
+        # check if the transaction response is duplicated.
+        if trans.execution_id in self._orderexecs[oid]:
+            return  # duplicated response and skip the processing.
+        else:
+            self._orderexecs[oid].append(trans.execution_id)
 
         try:
             oref = self._ordersrev[oid]
@@ -875,20 +884,26 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
             return
         print(f">>>> Current pending orders after popping: {self._ordersrev}")
 
-        ttype = trans['status']
+        # ttype = trans['status']
+        ttype = trans.order['status']
 
         if ttype in self._X_ORDER_FILLED:
             print(">>>> process the order execution in _process_transaction.")
             # size = float(trans['filled_qty'])
+            # new_remsize = (-1 if trans['side'] == 'sell' else 1) * (float(trans['qty']) - float(trans['filled_qty']))
+            # size = order.executed.remsize - new_remsize
             if ttype == 'partially_filled':
                 self._ordersrev[oid] = oref
                 print(f">>>> Add back the pending order for the possible further exbits: {self._ordersrev}")
-                size = float(trans['filled_qty'])
-                if trans['side'] == 'sell':
-                    size = -size
-            else:
-                size = order.executed.remsize  # Alpaca sends the total quantity when the order is complete and only the remaining size will be filled.
-            price = float(trans['filled_avg_price'])  # Todo: to check with Alpaca if the filled price is the executed price of the last exbit.
+                # size = float(trans['filled_qty'])
+                # if trans['side'] == 'sell':
+                #     size = -size
+            # else:
+            #     size = order.executed.remsize  # Alpaca sends the total quantity when the order is complete and only the remaining size will be filled.
+            # price = float(trans['filled_avg_price'])
+            size = float(trans.qty) * (-1 if trans.order['side'] == 'sell' else 1)
+            price = float(trans.price)
+            print(f">>>> execute Order {oref} with size {size} and price {price}.")
             self.broker._fill(oref, size, price, ttype=ttype)
 
         elif ttype in self._X_ORDER_CREATE:
