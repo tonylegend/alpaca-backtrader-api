@@ -444,13 +444,13 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         if not dtend:
             dtend = pd.Timestamp('now', tz=NY)
         else:
-            dtend = pd.Timestamp(pytz.timezone('UTC').localize(dtend)) if \
+            dtend = pd.Timestamp(pytz.timezone('America/New_York').localize(dtend)) if \
               not dtend.tzname() else dtend
         if granularity == Granularity.Minute:
             calendar = exchange_calendars.get_calendar(name='NYSE')
             while not calendar.is_open_on_minute(dtend.ceil(freq='T')):
-                dtend = dtend.replace(hour=15,
-                                      minute=59,
+                dtend = dtend.replace(hour=16,
+                                      minute=0,
                                       second=0,
                                       microsecond=0)
                 dtend -= timedelta(days=1)
@@ -459,7 +459,7 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
             delta = timedelta(days=days)
             dtbegin = dtend - delta
         else:
-            dtbegin = pd.Timestamp(pytz.timezone('UTC').localize(dtbegin)) if \
+            dtbegin = pd.Timestamp(pytz.timezone('America/New_York').localize(dtbegin)) if \
               not dtbegin.tzname() else dtbegin
         while dtbegin > dtend:
             # if we start the script during market hours we could get this
@@ -545,6 +545,7 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
             """
             only interested in samples between 9:30, 16:00 NY time
             """
+            df.index = df.index.tz_convert(pytz.timezone('America/New_York'))
             return df.between_time("09:30", "16:00")
 
         def _drop_early_samples(df):
@@ -552,6 +553,7 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
             samples from server don't start at 9:30 NY time
             let's drop earliest samples
             """
+            df.index = df.index.tz_convert(pytz.timezone('America/New_York'))
             for i, b in df.iterrows():
                 if i.time() >= dtime(9, 30):
                     return df[i:]
@@ -575,6 +577,7 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
                     ('volume', 'sum'),
                 ])
             )
+            df.index = df.index.tz_convert(pytz.timezone('America/New_York'))
             if granularity == Granularity.Minute:
                 return df.between_time("09:30", "16:00")
             else:
@@ -595,8 +598,9 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
             response = _resample(cdl)
         else:
             response = cdl
-        response = response.dropna()
-        response = response[~response.index.duplicated()]
+        if not response.empty:
+            response = response.dropna()
+            response = response[~response.index.duplicated()]
         return response
 
     def streaming_prices(self,
