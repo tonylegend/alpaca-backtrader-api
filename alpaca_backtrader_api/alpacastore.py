@@ -444,7 +444,11 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         if not dtend:
             dtend = pd.Timestamp('now', tz=NY)
         else:
-            dtend = pd.Timestamp(pytz.timezone('America/New_York').localize(dtend)) if \
+            # dtbegin and dtend are UTC native time, even when you set the timezone in datafactory.
+            # start and end input to datafactory can be either timezone aware datetime or NY native datetime to be converted to utc.
+            # dtend = pd.Timestamp(pytz.timezone('America/New_York').localize(dtend)) if \
+            #     not dtend.tzname() else dtend
+            dtend = pd.Timestamp(pytz.timezone('UTC').localize(dtend)) if \
               not dtend.tzname() else dtend
         if granularity == Granularity.Minute:
             calendar = exchange_calendars.get_calendar(name='NYSE')
@@ -460,7 +464,9 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
             delta = timedelta(days=days)
             dtbegin = dtend - delta
         else:
-            dtbegin = pd.Timestamp(pytz.timezone('America/New_York').localize(dtbegin)) if \
+            # dtbegin = pd.Timestamp(pytz.timezone('America/New_York').localize(dtbegin)) if \
+            #     not dtbegin.tzname() else dtbegin
+            dtbegin = pd.Timestamp(pytz.timezone('UTC').localize(dtbegin)) if \
               not dtbegin.tzname() else dtbegin
         while dtbegin > dtend:
             # if we start the script during market hours we could get this
