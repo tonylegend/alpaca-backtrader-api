@@ -260,14 +260,14 @@ class AlpacaBroker(with_metaclass(MetaAlpacaBroker, BrokerBase)):
 
         if closed:
             # Adjust to returned value for closed items & acquired opened items
-            closedvalue = comminfo.getoperationcost(closed, pprice_orig)
+            closedvalue = comminfo.getvaluesize(-closed, pprice_orig)
             # Calculate and substract commission
             closedcomm = comminfo.getcommission(closed, price)
         else:
             closedvalue = closedcomm = 0.0
 
         if opened:
-            openedvalue = comminfo.getoperationcost(opened, price)
+            openedvalue = comminfo.getvaluesize(opened, price)
             openedcomm = comminfo.getcommission(opened, price)
             # record adjust price base for end of bar cash adjustment
             pos.adjbase = price
