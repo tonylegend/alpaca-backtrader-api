@@ -287,7 +287,9 @@ class AlpacaBroker(with_metaclass(MetaAlpacaBroker, BrokerBase)):
             # print(f">>>> data datetime {bt.num2date(data.datetime[0])}")
             # print(f">>>> data datetime when filled: {data.datetime[0]}")
             # pos.update(execsize, price, bt.num2date(data.datetime[0]))
-            pos.update(execsize, price, data.datetime[0])
+            dt = kwargs['dt'] if 'dt' in kwargs else data.datetime[0]
+            print(f">>>> order {oref} was filled at {dt}.")
+            pos.update(execsize, price, dt)
             # Execute and notify the order
             order.execute(data.datetime[0], execsize, price,
                           closed, closedvalue, closedcomm,

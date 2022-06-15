@@ -914,8 +914,13 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
             # price = float(trans['filled_avg_price'])
             size = float(trans.qty) * (-1 if trans.order['side'] == 'sell' else 1)
             price = float(trans.price)
-            print(f">>>> execute Order {oref} with size {size} and price {price}.")
-            self.broker._fill(oref, size, price, ttype=ttype)
+            dtstr = trans.order['filled_at']
+            if dtstr is None or len(dtstr) <= 0:
+                dtstr = trans.timestamp
+            dtobj = pd.Timestamp(dtstr, unit='ns')
+            dt = bt.date2num(dtobj)
+            print(f">>>> execute Order {oref} with size {size} and price {price} at {dtobj}.")
+            self.broker._fill(oref, size, price, ttype=ttype, dt=dt)
 
         elif ttype in self._X_ORDER_CREATE:
             print(">>>> process the order accept in _process_transaction.")
