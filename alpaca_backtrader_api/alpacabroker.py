@@ -291,7 +291,8 @@ class AlpacaBroker(with_metaclass(MetaAlpacaBroker, BrokerBase)):
             print(f">>>> order {oref} was filled at {dt}.")
             pos.update(execsize, price, dt)
             # Execute and notify the order
-            order.execute(data.datetime[0], execsize, price,
+            order.execute(dt, execsize, price,
+            # order.execute(data.datetime[0], execsize, price,
                           closed, closedvalue, closedcomm,
                           opened, openedvalue, openedcomm,
                           margin, pnl,
