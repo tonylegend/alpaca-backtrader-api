@@ -157,7 +157,11 @@ class AlpacaBroker(with_metaclass(MetaAlpacaBroker, BrokerBase)):
         if not datas:
             # don't use self.o.get_value(). it takes time for local store to
             # get update from broker.
-            self.value = float(self.o.oapi.get_account().portfolio_value)
+            try:
+                self.value = float(self.o.oapi.get_account().portfolio_value)
+            except Exception as e:
+                print(f"Alpaca API error: {e}. Fall back to the local API to update value.")
+                self.value = self.o.get_value()
             return self.value
         else:
             # let's calculate the value of the positions
