@@ -1,10 +1,12 @@
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone, time
+import time as _time
+import threading
 import pandas as pd
 from backtrader.feed import DataBase
-from backtrader import date2num, num2date
+from backtrader import date2num, num2date, TimeFrame
 from backtrader.utils.py3 import queue, with_metaclass
 import backtrader as bt
 
@@ -129,6 +131,9 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
         ('backfill_from', None),  # additional data source to do backfill from
         ('bidask', True),
         ('useask', False),
+        ('candles', False),
+        ('candles_delay', 1),
+        ('adjstarttime', False),  # adjust start time of candle
         ('includeFirst', True),
         ('reconnect', True),
         ('reconnections', -1),  # forever
@@ -185,6 +190,8 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
         self._storedmsg = dict()  # keep pending live message (under None)
         self.qlive = queue.Queue()
         self._state = self._ST_OVER
+        self._reconns = self.p.reconnections
+        self.contractdetails = None
 
         # Kickstart store and get queue to wait on
         self.o.start(data=self)
@@ -204,6 +211,7 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
 
         if self.p.backfill_from is not None:
             self._state = self._ST_FROM
+            # self._st_start(True)
             self.p.backfill_from.setenvironment(self._env)
             self.p.backfill_from._start()
         else:
@@ -222,7 +230,7 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
 
             dtbegin = None
             if self.fromdate > float('-inf'):
-                dtbegin = num2date(self.fromdate)
+                dtbegin = num2date(self.fromdate, tz=timezone.utc)
 
             self.qhist = self.o.candles(
                 self.p.dataname, dtbegin, dtend,
@@ -232,10 +240,6 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
 
             self._state = self._ST_HISTORBACK
             return True
-        self.qlive = self.o.streaming_prices(self.p.dataname,
-                                             self.p.timeframe,
-                                             tmout=tmout,
-                                             data_feed=self.p.data_feed)
         if instart:
             self._statelivereconn = self.p.backfill_start
         else:
@@ -244,11 +248,138 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
         if self._statelivereconn:
             self.put_notification(self.DELAYED)
 
+        if not self.p.candles:
+            # recreate a new stream on call
+            self.qlive = self.o.streaming_prices(self.p.dataname,
+                                                 self.p.timeframe,
+                                                 tmout=tmout,
+                                                 data_feed=self.p.data_feed)
+        elif instart:
+            # poll thread will never die, so no need to recreate it.
+            self.poll_thread()
+
         self._state = self._ST_LIVE
-        if instart:
-            self._reconns = self.p.reconnections
+        # if instart:
+        #     self._reconns = self.p.reconnections
 
         return True  # no return before - implicit continue
+
+    def poll_thread(self):
+        t = threading.Thread(target=self._t_poll)
+        t.daemon = True
+        t.start()
+
+    def _t_poll(self):
+        dtstart = self._getstarttime(
+            self._timeframe,
+            self._compression,
+            offset=1)
+        while True:
+            dtcurr = self._getstarttime(self._timeframe, self._compression)
+            # request candles in live instead of stream
+            if dtcurr > dtstart:
+                if len(self) > 1:
+                    # len == 1 ... forwarded for the 1st time
+                    dtbegin = self.datetime.datetime(-1)
+                elif self.fromdate > float('-inf'):
+                    dtbegin = num2date(self.fromdate, tz=timezone.utc)
+                else:  # 1st bar and no begin set
+                    dtbegin = dtstart
+                self.qlive = self.o.candles(
+                    self.p.dataname, dtbegin, None,
+                    self._timeframe, self._compression,
+                    candleFormat=self._candleFormat,
+                    # onlyComplete=True,  # not sure if alpaca support this argument.
+                    includeFirst=False)
+                dtstart = dtbegin
+                # sleep until next call
+                dtnow = datetime.utcnow()
+                dtnext = self._getstarttime(
+                    self._timeframe,
+                    self._compression,
+                    dt=dtnow,
+                    offset=-1)
+                dtdiff = dtnext - dtnow
+                tmout = (dtdiff.days * 24 * 60 * 60) + \
+                    dtdiff.seconds + self.p.candles_delay
+                if tmout <= 0:
+                    tmout = self.p.candles_delay
+                _time.sleep(tmout)
+
+    def _getstarttime(self, timeframe, compression, dt=None, offset=0):
+        '''
+        This method will return the start of the period based on current
+        time (or provided time).
+        '''
+        sessionstart = self.p.sessionstart
+        if sessionstart is None:
+            # use UTC 22:00 (5:00 pm New York) as default
+            sessionstart = time(hour=22, minute=0, second=0)
+        if dt is None:
+            dt = datetime.utcnow()
+        if timeframe == TimeFrame.Seconds:
+            dt = dt.replace(
+                second=(dt.second // compression) * compression,
+                microsecond=0)
+            if offset:
+                dt = dt - timedelta(seconds=compression*offset)
+        elif timeframe == TimeFrame.Minutes:
+            if compression >= 60:
+                hours = 0
+                minutes = 0
+                # get start of day
+                dtstart = self._getstarttime(TimeFrame.Days, 1, dt)
+                # diff start of day with current time to get seconds
+                # since start of day
+                dtdiff = dt - dtstart
+                hours = dtdiff.seconds//((60*60)*(compression//60))
+                minutes = compression % 60
+                dt = dtstart + timedelta(hours=hours, minutes=minutes)
+            else:
+                dt = dt.replace(
+                    minute=(dt.minute // compression) * compression,
+                    second=0,
+                    microsecond=0)
+            if offset:
+                dt = dt - timedelta(minutes=compression*offset)
+        elif timeframe == TimeFrame.Days:
+            if dt.hour < sessionstart.hour:
+                dt = dt - timedelta(days=1)
+            if offset:
+                dt = dt - timedelta(days=offset)
+            dt = dt.replace(
+                hour=sessionstart.hour,
+                minute=sessionstart.minute,
+                second=sessionstart.second,
+                microsecond=sessionstart.microsecond)
+        elif timeframe == TimeFrame.Weeks:
+            if dt.weekday() != 6:
+                # sunday is start of week at 5pm new york
+                dt = dt - timedelta(days=dt.weekday() + 1)
+            if offset:
+                dt = dt - timedelta(days=offset * 7)
+            dt = dt.replace(
+                hour=sessionstart.hour,
+                minute=sessionstart.minute,
+                second=sessionstart.second,
+                microsecond=sessionstart.microsecond)
+        elif timeframe == TimeFrame.Months:
+            if offset:
+                dt = dt - timedelta(days=(min(28 + dt.day, 31)))
+            # last day of month
+            last_day_of_month = dt.replace(day=28) + timedelta(days=4)
+            last_day_of_month = last_day_of_month - timedelta(
+                days=last_day_of_month.day)
+            last_day_of_month = last_day_of_month.day
+            # start of month (1 at 0, 22 last day of prev month)
+            if dt.day < last_day_of_month:
+                dt = dt - timedelta(days=dt.day)
+            dt = dt.replace(
+                hour=sessionstart.hour,
+                minute=sessionstart.minute,
+                second=sessionstart.second,
+                microsecond=sessionstart.microsecond)
+        return dt
 
     def stop(self):
         """
@@ -256,6 +387,19 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
         """
         super(AlpacaData, self).stop()
         self.o.stop()
+
+    def replay(self, **kwargs):
+        # save original timeframe and compression to fetch data
+        # they will be overriden when calling replay
+        orig_timeframe = self._timeframe
+        orig_compression = self._compression
+        # setting up replay configuration
+        super(DataBase, self).replay(**kwargs)
+        # putting back original timeframe and compression to fetch correct data
+        # the replay configuration will still use the correct dataframe and
+        # compression for strategy
+        self._timeframe = orig_timeframe
+        self._compression = orig_compression
 
     def haslivedata(self):
         return bool(self._storedmsg or self.qlive)  # do not return the objs
@@ -271,6 +415,7 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
                            self.qlive.get(timeout=self._qcheck))
                 except queue.Empty:
                     return None  # indicate timeout situation
+
                 if msg is None:  # Conn broken during historical/backfilling
                     self.put_notification(self.CONNBROKEN)
                     # Try to reconnect
@@ -279,7 +424,10 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
                         self.put_notification(self.DISCONNECTED)
                         self._state = self._ST_OVER
                         return False  # failed
-
+                    # sleep only on reconnect
+                    if self._reconns != self.p.reconnections:
+                        _time.sleep(self.o.p.reconntimeout)
+                    # Can reconnect
                     self._reconns -= 1
                     self._st_start(instart=False, tmout=self.p.reconntimeout)
                     continue
@@ -291,13 +439,15 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
                         self.put_notification(self.DISCONNECTED)
                         self._state = self._ST_OVER
                         return False  # failed
-
+                    # Try to reconnect
                     if not self.p.reconnect or self._reconns == 0:
                         # Can no longer reconnect
                         self.put_notification(self.DISCONNECTED)
                         self._state = self._ST_OVER
                         return False  # failed
-
+                    # sleep only on reconnect
+                    if self._reconns != self.p.reconnections:
+                        _time.sleep(self.o.p.reconntimeout)
                     # Can reconnect
                     self._reconns -= 1
                     self._st_start(instart=False, tmout=self.p.reconntimeout)
@@ -310,15 +460,18 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
                     if self._laststatus != self.LIVE:
                         if self.qlive.qsize() <= 1:  # very short live queue
                             self.put_notification(self.LIVE)
-                    if self.p.timeframe == bt.TimeFrame.Ticks:
-                        ret = self._load_tick(msg)
-                    elif self.p.timeframe == bt.TimeFrame.Minutes:
-                        ret = self._load_agg(msg)
-                    else:
-                        # might want to act differently in the future
-                        ret = self._load_agg(msg)
-                    if ret:
-                        return True
+                    if msg:
+                        if self.p.candles:
+                            ret = self._load_candle(msg)
+                        elif self.p.timeframe == bt.TimeFrame.Ticks:
+                            ret = self._load_tick(msg)
+                        elif self.p.timeframe == bt.TimeFrame.Minutes:
+                            ret = self._load_agg(msg)
+                        else:
+                            # might want to act differently in the future
+                            ret = self._load_agg(msg)
+                        if ret:
+                            return True
 
                     # could not load bar ... go and get new one
                     continue
@@ -333,14 +486,14 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
                 dtend = None
                 if len(self) > 1:
                     # len == 1 ... forwarded for the 1st time
-                    dtbegin = self.datetime.datetime(-1)
+                    dtbegin = self.datetime.datetime(-1).astimezone(timezone.utc)
                 elif self.fromdate > float('-inf'):
-                    dtbegin = num2date(self.fromdate)
+                    dtbegin = num2date(self.fromdate, tz=timezone.utc)
                 else:  # 1st bar and no begin set
                     # passing None to fetch max possible in 1 request
                     dtbegin = None
-
-                dtend = pd.Timestamp(msg['time'], unit='ns')
+                if msg:
+                    dtend = pd.Timestamp(msg['time'], unit='ns', tz='UTC')
 
                 self.qhist = self.o.candles(
                     self.p.dataname, dtbegin, dtend,
@@ -361,15 +514,20 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
                     return False  # error management cancelled the queue
 
                 elif 'code' in msg:  # Error
-                    self.put_notification(self.NOTSUBSCRIBED)
-                    self.put_notification(self.DISCONNECTED)
-                    self._state = self._ST_OVER
-                    return False
+                    if not self.p.reconnect or self._reconns == 0:
+                        # Can no longer reconnect
+                        self.put_notification(self.NOTSUBSCRIBED)
+                        self.put_notification(self.DISCONNECTED)
+                        self._state = self._ST_OVER
+                        return False
+                    # Can reconnect
+                    self._reconns -= 1
+                    self._st_start(instart=False)
+                    continue
 
                 if msg:
                     if self._load_history(msg):
                         return True  # loading worked
-
                     continue  # not loaded ... date may have been seen
                 else:
                     # End of histdata
@@ -443,6 +601,15 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
 
     def _load_history(self, msg):
         dtobj = msg['time'].to_pydatetime()
+        if self.p.adjstarttime:
+            # move time to start time of next candle
+            # and subtract 0.1 miliseconds (ensures no
+            # rounding issues, 10 microseconds is minimum)
+            dtobj = self._getstarttime(
+                self.p.timeframe,
+                self.p.compression,
+                dtobj,
+                -1) - timedelta(microseconds=100)
         dt = date2num(dtobj)
         if dt <= self.lines.datetime[-1]:
             return False  # time already seen

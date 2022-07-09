@@ -5,24 +5,29 @@ import collections
 import time
 from enum import Enum
 import traceback
+import copy
 
 from datetime import datetime, timedelta, time as dtime
 from dateutil.parser import parse as date_parse
 import time as _time
 import exchange_calendars
+from exchange_calendars.calendar_helpers import parse_timestamp
 import threading
 import asyncio
 
 import alpaca_trade_api as tradeapi
-from alpaca_trade_api.rest import TimeFrame
+from alpaca_trade_api.rest import TimeFrame, TimeFrameUnit
 from alpaca_trade_api.stream import Stream
 import pytz
 import requests
 import pandas as pd
-
+import numpy as np
 import backtrader as bt
 from backtrader.metabase import MetaParams
 from backtrader.utils.py3 import queue, with_metaclass
+import logging
+
+logger = logging.getLogger(__name__)
 
 NY = 'America/New_York'
 
@@ -92,10 +97,35 @@ class API(tradeapi.REST):
         return None
 
 
+class AsyncAPI(tradeapi.rest_async.AsyncRest):
+    async def _request(self, url, payload):
+        # Added the try block
+        try:
+            return super(AsyncAPI, self)._request(url, payload)
+        except requests.RequestException as e:
+            resp = AlpacaRequestError().error_response
+            resp['description'] = str(e)
+            return resp
+        # except tradeapi.rest.APIError as e:
+        #     # changed from raise to return
+        #     return e._error
+        except Exception as e:
+            resp = AlpacaNetworkError().error_response
+            resp['description'] = str(e)
+            return resp
+        return None
+
+class DataType(str, Enum):
+    Bars = "Bars"
+    Trades = "Trades"
+    Quotes = "Quotes"
+
 class Granularity(Enum):
     Ticks = "ticks"
     Daily = "day"
     Minute = "minute"
+    Week = "week"
+    Month = "month"
 
 
 class StreamingMethod(Enum):
@@ -165,6 +195,38 @@ class Streamer:
         self.q.put(msg)
 
 
+class SerializableEvent(object):
+    '''A threading.Event that can be serialized.'''
+
+    def __init__(self):
+        self.evt = threading.Event()
+
+    def set(self):
+        return self.evt.set()
+
+    def clear(self):
+        return self.evt.clear()
+
+    def isSet(self):
+        return self.evt.isSet()
+
+    def wait(self, timeout=0):
+        return self.evt.wait(timeout)
+
+    def __getstate__(self):
+        d = copy.copy(self.__dict__)
+        if self.evt.isSet():
+            d['evt'] = True
+        else:
+            d['evt'] = False
+        return d
+
+    def __setstate__(self, d):
+        self.evt = threading.Event()
+        if d['evt']:
+            self.evt.set()
+
+
 class MetaSingleton(MetaParams):
     '''Metaclass to make a metaclassed class a singleton'''
 
@@ -203,7 +265,8 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         ('secret_key', ''),
         ('paper', False),
         ('account_tmout', 10.0),  # account balance refresh timeout
-        ('api_version', None)
+        ('api_version', None),
+        ('reconntimeout', 5.0),  # timeout between reconnections
     )
 
     _DTEPOCH = datetime(1970, 1, 1)
@@ -246,10 +309,15 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
                         self.p.secret_key,
                         self.p.base_url,
                         self.p.api_version)
+        self.aapi = AsyncAPI(key_id=self.p.key_id, secret_key=self.p.secret_key)
 
         self._cash = 0.0
         self._value = 0.0
-        self._evt_acct = threading.Event()
+        self._currency = None  # account currency
+        self._leverage = 1  # leverage
+        # self._client_id_prefix = str(datetime.now().timestamp())
+        # self._evt_acct = threading.Event()
+        self._evt_acct = SerializableEvent()  # use the serializable thread event instead.
 
     def start(self, data=None, broker=None):
         # Datas require some processing to kickstart data reception
@@ -308,10 +376,12 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
     def get_granularity(self, timeframe, compression) -> Granularity:
         if timeframe == bt.TimeFrame.Ticks:
             return Granularity.Ticks
-        if timeframe == bt.TimeFrame.Minutes:
+        elif timeframe == bt.TimeFrame.Minutes:
             return Granularity.Minute
         elif timeframe == bt.TimeFrame.Days:
             return Granularity.Daily
+        else:
+            return None
 
     def get_instrument(self, dataname):
         try:
@@ -388,22 +458,25 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
 
     def _t_candles(self, dataname, dtbegin, dtend, timeframe, compression,
                    candleFormat, includeFirst, q):
+        '''Callback method for candles request'''
         granularity: Granularity = self.get_granularity(timeframe, compression)
-        dtbegin, dtend = self._make_sure_dates_are_initialized_properly(
-            dtbegin, dtend, granularity)
-
         if granularity is None:
             e = AlpacaTimeFrameError('granularity is missing')
             q.put(e.error_response)
             return
+
+        # utc native or timezone-aware time to convert to NY timezone-aware time
+        dtbegin, dtend = self._make_sure_dates_are_initialized_properly(
+            dtbegin, dtend, granularity)
+
         try:
-            cdl = self.get_aggs_from_alpaca(dataname,
+            cdl = self.get_aggs_from_alpaca2(dataname,
                                             dtbegin,
                                             dtend,
                                             granularity,
                                             compression)
         except AlpacaError as e:
-            print(str(e))
+            logger.error(str(e))
             q.put(e.error_response)
             q.put(None)
             return
@@ -415,11 +488,16 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
 
         # don't use dt.replace. use localize
         # (https://stackoverflow.com/a/1592837/2739124)
+        # Todo: check if dtbegin and dtend are NY native time or UTC (tz or native) time
+        dt_ny = lambda dt: pytz.timezone(NY).localize(dt, is_dst=None) if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None else dt
+
         cdl = cdl.loc[
-              pytz.timezone(NY).localize(dtbegin) if
-              not dtbegin.tzname() else dtbegin:
-              pytz.timezone(NY).localize(dtend) if
-              not dtend.tzname() else dtend
+              # pytz.timezone(NY).localize(dtbegin) if
+              # not dtbegin.tzname() else dtbegin:
+              dt_ny(dtbegin):
+              # pytz.timezone(NY).localize(dtend) if
+              # not dtend.tzname() else dtend
+              dt_ny(dtend)
               ].dropna(subset=['high'])
         records = cdl.reset_index().to_dict('records')
         for r in records:
@@ -441,17 +519,19 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         :param granularity:
         :return:
         """
+        calendar = exchange_calendars.get_calendar(name='NYSE')
+        ts_utc = lambda dt: pd.Timestamp(pytz.timezone('UTC').localize(dt, is_dst=None)) if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None else dt
         if not dtend:
-            dtend = pd.Timestamp('now', tz=NY)
+            dtend = pd.Timestamp.now(tz=NY)
         else:
             # dtbegin and dtend are UTC native time, even when you set the timezone in datafactory.
             # start and end input to datafactory can be either timezone aware datetime or NY native datetime to be converted to utc.
             # dtend = pd.Timestamp(pytz.timezone('America/New_York').localize(dtend)) if \
             #     not dtend.tzname() else dtend
-            dtend = pd.Timestamp(pytz.timezone('UTC').localize(dtend)) if \
-              not dtend.tzname() else dtend
+            # dtend = pd.Timestamp(pytz.timezone('UTC').localize(dtend)) if \
+            #   not dtend.tzname() else dtend
+            dtend = ts_utc(dtend)
         if granularity == Granularity.Minute:
-            calendar = exchange_calendars.get_calendar(name='NYSE')
             dtend = calendar.minute_to_trading_minute(dtend.ceil(freq='T'), direction="previous")
             # while not calendar.is_open_on_minute(dtend.ceil(freq='T')):
             #     dtend = dtend.replace(hour=16,
@@ -461,17 +541,21 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
             #     dtend -= timedelta(days=1)
         if not dtbegin:
             days = 30 if granularity == Granularity.Daily else 3
-            delta = timedelta(days=days)
-            dtbegin = dtend - delta
+            # delta = pd.Timedelta(days=days)
+            # dtbegin = dtend - delta
+            dtbegin = calendar.session_open(calendar.minute_to_past_session(dtend, count=days))
         else:
             # dtbegin = pd.Timestamp(pytz.timezone('America/New_York').localize(dtbegin)) if \
             #     not dtbegin.tzname() else dtbegin
-            dtbegin = pd.Timestamp(pytz.timezone('UTC').localize(dtbegin)) if \
-              not dtbegin.tzname() else dtbegin
-        while dtbegin > dtend:
-            # if we start the script during market hours we could get this
-            # situation. this resolves that.
-            dtbegin -= timedelta(days=1)
+            # dtbegin = pd.Timestamp(pytz.timezone('UTC').localize(dtbegin)) if \
+            #   not dtbegin.tzname() else dtbegin
+            dtbegin = ts_utc(dtbegin)
+        # while dtbegin > dtend:
+        #     # if we start the script during market hours we could get this
+        #     # situation. this resolves that.
+        #     dtbegin -= timedelta(days=1)
+        if dtbegin > dtend:
+            dtbegin = calendar.session_open(calendar.minute_to_past_session(dtend))
         return dtbegin.astimezone(NY), dtend.astimezone(NY)
 
     def get_aggs_from_alpaca(self,
@@ -660,6 +744,7 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
     }
 
     def broker_threads(self):
+        '''Creates threads for broker functionality'''
         self.q_account = queue.Queue()
         self.q_account.put(True)  # force an immediate update
         t = threading.Thread(target=self._t_account)
@@ -691,7 +776,7 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
             try:
                 accinfo = self.oapi.get_account()
             except Exception as e:
-                self.put_notification(e)
+                self.put_notification(str(e))
                 continue
 
             if 'code' in accinfo._raw:
@@ -700,6 +785,8 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
             try:
                 self._cash = float(accinfo.cash)
                 self._value = float(accinfo.portfolio_value)
+                self._currency = accinfo.currency
+                # self._leverage = float(accinfo.multiplier)
             except KeyError:
                 pass
 
@@ -761,17 +848,17 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         def _check_if_transaction_occurred(order_id):
             # a transaction may have happened and was stored. if so let's
             # process it
-            print(">>>> check if transaction occurred")
-            print(f">>>> Current pending transactions: {self._transpend.keys()}")
+            logger.info(">>>> check if transaction occurred")
+            logger.info(f">>>> Current pending transactions: {self._transpend.keys()}")
             tpending = self._transpend[order_id]
             tpending.append(None)  # eom marker
-            print(f">>>> The pending transactions for order id {order_id}: {tpending}")
+            logger.info(f">>>> The pending transactions for order id {order_id}: {tpending}")
             while True:
                 trans = tpending.popleft()
                 if trans is None:
                     break
                 self._process_transaction(order_id, trans)
-            print(f">>>> The pending transactions after checking: {self._transpend.keys()}")
+            logger.info(f">>>> The pending transactions after checking: {self._transpend.keys()}")
 
         while True:
             try:
@@ -781,11 +868,11 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
                 if msg is None:
                     continue
                 oref, okwargs = msg
-                print(f">>>> Create oref {oref} okwargs {okwargs}")
+                logger.info(f">>>> Create oref {oref} okwargs {okwargs}")
                 try:
                     o = self.oapi.submit_order(**okwargs)
                 except Exception as e:
-                    self.put_notification(e)
+                    self.put_notification(str(e))
                     self.broker._reject(oref)
                     continue
                 try:
@@ -810,7 +897,7 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
 
                 _check_if_transaction_occurred(oid)
                 if o.legs:
-                    print(f">>>> Process leg orders {o.legs}.")
+                    logger.info(f">>>> Process leg orders {o.legs}.")
                     index = 1
                     for leg in o.legs:
                         self._orders[oref + index] = leg.id
@@ -818,11 +905,11 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
                         _check_if_transaction_occurred(leg.id)
                     self.broker._submit(oref)  # inside it submits the legs too
                     if okwargs['type'] == 'market':
-                        print(f">>>> Immediately accept the market order {oid}")
+                        logger.info(f">>>> Immediately accept the market order {oid}")
                         self.broker._accept(oref)  # taken immediately
 
             except Exception as e:
-                print(str(e))
+                logger.error(str(e))
 
     def order_cancel(self, order):
         self.q_orderclose.put(order.ref)
@@ -859,9 +946,9 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         # oid which has not yet been returned after creating an order. Hence
         # store if not yet seen, else forward to processer
 
-        print(f">>>>>>> Received the transaction response: {trans}")
-        print(f">>>> Current pending transactions: {self._transpend.keys()}")
-        print(f"current status: {trans.order['status']}")
+        logger.info(f">>>>>>> Received the transaction response: {trans}")
+        logger.info(f">>>> Current pending transactions: {self._transpend.keys()}")
+        logger.info(f"current status: {trans.order['status']}")
         # oid = trans['id']
         oid = trans.order['id']
 
@@ -873,10 +960,10 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
 
         try:
             oref = self._ordersrev[oid]
-            print(f"order {oid} was created. let's process it.")
+            logger.info(f"order {oid} was created. let's process it.")
             self._process_transaction(oid, trans)
         except KeyError:
-            print(f"order {oid} has not yet created, let's store it in the pending order list and process it in the order create session.")
+            logger.info(f"order {oid} has not yet created, let's store it in the pending order list and process it in the order create session.")
             self._transpend[oid].append(trans)
 
         # if not self._ordersrev.get(oid, False):
@@ -889,27 +976,27 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
     _X_ORDER_FILLED = ('partially_filled', 'filled',)
 
     def _process_transaction(self, oid, trans):
-        print(f">>>> Start processing the transaction for order id {oid}.")
-        print(f">>>> Current pending orders: {self._ordersrev}")
+        logger.info(f">>>> Start processing the transaction for order id {oid}.")
+        logger.info(f">>>> Current pending orders: {self._ordersrev}")
         try:
             oref = self._ordersrev.pop(oid)
             order = self.broker.orders[oref]
         except KeyError:
-            print(f">>>> the order id {oid} has not been created yet. skip the processing.")
+            logger.info(f">>>> the order id {oid} has not been created yet. skip the processing.")
             return
-        print(f">>>> Current pending orders after popping: {self._ordersrev}")
+        logger.info(f">>>> Current pending orders after popping: {self._ordersrev}")
 
         # ttype = trans['status']
         ttype = trans.order['status']
 
         if ttype in self._X_ORDER_FILLED:
-            print(">>>> process the order execution in _process_transaction.")
+            logger.info(">>>> process the order execution in _process_transaction.")
             # size = float(trans['filled_qty'])
             # new_remsize = (-1 if trans['side'] == 'sell' else 1) * (float(trans['qty']) - float(trans['filled_qty']))
             # size = order.executed.remsize - new_remsize
             if ttype == 'partially_filled':
                 self._ordersrev[oid] = oref
-                print(f">>>> Add back the pending order for the possible further exbits: {self._ordersrev}")
+                logger.info(f">>>> Add back the pending order for the possible further exbits: {self._ordersrev}")
                 # size = float(trans['filled_qty'])
                 # if trans['side'] == 'sell':
                 #     size = -size
@@ -923,13 +1010,13 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
                 dtstr = trans.timestamp
             dtobj = pd.Timestamp(dtstr, unit='ns')
             dt = bt.date2num(dtobj)
-            print(f">>>> execute Order {oref} with size {size} and price {price} at {dtobj}.")
+            logger.info(f">>>> execute Order {oref} with size {size} and price {price} at {dtobj}.")
             self.broker._fill(oref, size, price, ttype=ttype, dt=dt)
 
         elif ttype in self._X_ORDER_CREATE:
-            print(">>>> process the order accept in _process_transaction.")
+            logger.info(">>>> process the order accept in _process_transaction.")
             self._ordersrev[oid] = oref
-            print(f">>>> Add back the pending order for further processing: {self._ordersrev}")
+            logger.info(f">>>> Add back the pending order for further processing: {self._ordersrev}")
             self.broker._accept(oref)
 
         elif ttype == 'calculated':
@@ -938,7 +1025,119 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         elif ttype == 'expired':
             self.broker._expire(oref)
         else:  # default action ... if nothing else
-            print("Process transaction - Order type: {}".format(ttype))
+            logger.info("Process transaction - Order type: {}".format(ttype))
             self.broker._reject(oref)
 
-        print(f">>>> the pending orders after processing this transaction: {self._ordersrev}")
+        logger.info(f">>>> the pending orders after processing this transaction: {self._ordersrev}")
+
+    def get_aggs_from_alpaca2(
+            self,
+            dataname,
+            start,
+            end,
+            granularity: Granularity,
+            compression,
+    ):
+
+        def _get_async_data_method(data_type: DataType = DataType.Bars):
+            if data_type == DataType.Bars:
+                return self.aapi.get_bars_async
+            elif data_type == DataType.Trades:
+                return self.aapi.get_trades_async
+            elif data_type == DataType.Quotes:
+                return self.aapi.get_quotes_async
+            else:
+                raise Exception(f"Unsupported data type: {data_type}")
+
+        def _granularity_to_timeframe(granularity, compression: int = 1):
+            if granularity in [Granularity.Minute, Granularity.Ticks]:
+                timeframe = TimeFrame(amount=compression, unit=TimeFrameUnit.Minute)
+            elif granularity == Granularity.Daily:
+                timeframe = TimeFrame(amount=compression, unit=TimeFrameUnit.Day)
+            elif granularity == Granularity.Week:
+                timeframe = TimeFrame(amount=compression, unit=TimeFrameUnit.Week)
+            elif granularity == Granularity.Month:
+                timeframe = TimeFrame(amount=compression, unit=TimeFrameUnit.Month)
+            else:
+                timeframe = TimeFrame(amount=compression, unit=TimeFrameUnit.Minute)
+            return timeframe
+
+        async def _get_hist_mkt_data_packet(symbol: str, start: datetime, end: datetime, granularity: Granularity, compression: int = 1, data_type: DataType = DataType.Bars, limit: int = 1000, adj: str = 'raw', raise_error: bool = False):
+            msg = f"Getting {data_type} data for symbol {symbol}"
+            msg += f", timeframe: {granularity}" if granularity else ""
+            msg += f" between dates: start={start}, end={end}"
+            logger.info(msg)
+            start_str, end_str = start.isoformat(), end.isoformat()
+            args = [symbol, start_str, end_str, _granularity_to_timeframe(granularity, compression).value, limit, adj] if data_type == DataType.Bars \
+                else [symbol, start_str, end_str]
+            try:
+                response = await _get_async_data_method(data_type)(*args)
+                symbol, df = response
+                if len(df):
+                    df = df.dropna()
+                    df = df[~df.index.duplicated()]
+                else:
+                    logger.error(f"Bad request for {symbol}.")
+                    if raise_error:
+                        raise Exception(f"Bad request for {symbol}.")
+                results = (symbol, df)
+            except Exception as e:
+                logger.error(f"Got an error: {e}")
+                traceback.print_exc()
+                if raise_error:
+                    raise e
+                results = (symbol, e)
+            return results
+
+        def _get_update_periods(start, end, period_days_limit: int = 3) -> list:
+            tcal = exchange_calendars.get_calendar(name='NYSE')
+            current_time = pd.Timestamp.now(tz='UTC')
+            start = parse_timestamp(start if start else tcal.minute_to_past_session(current_time), calendar=tcal, utc=True)
+            end = parse_timestamp(end if end else tcal.minute_to_future_session(current_time), calendar=tcal, utc=True)
+            start = tcal.minute_to_trading_minute(start, direction='next')
+            end = tcal.minute_to_trading_minute(end, direction='previous')
+            assert start < end, f"the start date {start} must be less than the end date {end}."
+            dti_range = tcal.sessions_in_range(tcal.minute_to_session(start), tcal.minute_to_session(end))
+            if dti_range.empty:
+                logger.warning(f"there is no valid session between {start} and {end}.")
+                return []
+            # Create a working dataframe to find the consecutive periods.
+            df_dates = pd.DataFrame(np.nan, index=dti_range, columns=['mark'])
+            # mark the non-consecutive dates
+            df_dates = df_dates.apply(
+                lambda p: pd.Series([False] + [tcal.sessions_distance(p.index[n - 1], p.index[n]) > 2 for n in range(1, p.shape[0])])
+            )
+            df_dates['period'] = df_dates.cumsum()
+            df_dates = df_dates.groupby('period', as_index=False).apply(lambda p: p.reset_index(drop=True))
+            # Divide the long periods into multiple periods within the period days limit due to the limit of the web api response data size.
+            df_dates.loc[(df_dates.index.get_level_values(-1)) % period_days_limit == 0, ['mark']] = True
+            df_dates['period'] = df_dates['mark'].cumsum()
+            df_dates = df_dates.set_index(dti_range)
+            df_dates = df_dates.index.to_series().groupby(df_dates['period']).agg(['first', 'last']).reset_index(drop=True).rename(columns={'first': 'start', 'last': 'end'})
+            df_dates['start'] = df_dates['start'].map(lambda x: tcal.session_open(x))
+            df_dates['end'] = df_dates['end'].map(lambda x: tcal.session_close(x))
+            df_dates.loc[df_dates.index[0], 'start'] = max(start, df_dates.loc[df_dates.index[0], 'start'])
+            df_dates.loc[df_dates.index[-1], 'end'] = min(end, df_dates.loc[df_dates.index[-1], 'end'])
+            df_dates = df_dates.query("start < @current_time")
+            return df_dates.values.tolist()
+
+        async def _get_hist_mkt_data(symbol: str, start, end, granularity, compression, raise_error: bool = False):
+            update_periods = _get_update_periods(start, end)
+            download_tasks = [asyncio.create_task(_get_hist_mkt_data_packet(symbol, start1, end1, granularity, compression, raise_error=raise_error)) for start1, end1 in update_periods]
+            download_results = list(await asyncio.gather(*download_tasks, return_exceptions=raise_error))
+            for r in download_results:
+                if isinstance(r, Exception) and raise_error:
+                    raise r
+            results = pd.DataFrame()
+            while download_results:
+                _, df = download_results.pop()
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    results = pd.concat([results, df])
+            return results
+
+        return asyncio.run(_get_hist_mkt_data(dataname, start, end, granularity, compression))
+
+
+    def get_leverage(self):
+        '''Returns the leverage of the account'''
+        return self._leverage

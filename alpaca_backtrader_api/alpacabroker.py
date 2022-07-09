@@ -10,6 +10,9 @@ from backtrader.position import Position
 import backtrader as bt
 
 from alpaca_backtrader_api import alpacastore
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class AlpacaCommInfo(CommInfoBase):
@@ -67,7 +70,7 @@ class AlpacaBroker(with_metaclass(MetaAlpacaBroker, BrokerBase)):
 
         self.startingcash = self.cash = 0.0
         self.startingvalue = self.value = 0.0
-        self.addcommissioninfo(self, AlpacaCommInfo(mult=1.0, stocklike=False))
+        # self.addcommissioninfo(self, AlpacaCommInfo(mult=1.0, stocklike=False))  # initialized in start()
 
     def update_positions(self):
         """
@@ -97,7 +100,7 @@ class AlpacaBroker(with_metaclass(MetaAlpacaBroker, BrokerBase)):
 
     def start(self):
         super(AlpacaBroker, self).start()
-        self.addcommissioninfo(self, AlpacaCommInfo(mult=1.0, stocklike=False))
+        self.addcommissioninfo(self, AlpacaCommInfo(mult=1.0, stocklike=False, leverage=self.o.get_leverage(), commtype=CommInfoBase.COMM_FIXED))
         self.o.start(broker=self)
         self.startingcash = self.cash = self.o.get_cash()
         self.startingvalue = self.value = self.o.get_value()
@@ -106,21 +109,24 @@ class AlpacaBroker(with_metaclass(MetaAlpacaBroker, BrokerBase)):
     def data_started(self, data):
         pos = self.getposition(data)
 
+        if pos.size == 0:
+            return
+
         if pos.size < 0:
             order = SellOrder(data=data,
                               size=pos.size, price=pos.price,
                               exectype=Order.Market,
                               simulated=True)
 
-            order.addcomminfo(self.getcommissioninfo(data))
-            order.execute(0, pos.size, pos.price,
-                          0, 0.0, 0.0,
-                          pos.size, 0.0, 0.0,
-                          0.0, 0.0,
-                          pos.size, pos.price)
-
-            order.completed()
-            self.notify(order)
+            # order.addcomminfo(self.getcommissioninfo(data))
+            # order.execute(0, pos.size, pos.price,
+            #               0, 0.0, 0.0,
+            #               pos.size, 0.0, 0.0,
+            #               0.0, 0.0,
+            #               pos.size, pos.price)
+            #
+            # order.completed()
+            # self.notify(order)
 
         elif pos.size > 0:
             order = BuyOrder(data=data,
@@ -128,15 +134,15 @@ class AlpacaBroker(with_metaclass(MetaAlpacaBroker, BrokerBase)):
                              exectype=Order.Market,
                              simulated=True)
 
-            order.addcomminfo(self.getcommissioninfo(data))
-            order.execute(0, pos.size, pos.price,
-                          0, 0.0, 0.0,
-                          pos.size, 0.0, 0.0,
-                          0.0, 0.0,
-                          pos.size, pos.price)
+        order.addcomminfo(self.getcommissioninfo(data))
+        order.execute(0, pos.size, pos.price,
+                      0, 0.0, 0.0,
+                      pos.size, 0.0, 0.0,
+                      0.0, 0.0,
+                      pos.size, pos.price)
 
-            order.completed()
-            self.notify(order)
+        order.completed()
+        self.notify(order)
 
     def stop(self):
         super(AlpacaBroker, self).stop()
@@ -160,7 +166,7 @@ class AlpacaBroker(with_metaclass(MetaAlpacaBroker, BrokerBase)):
             try:
                 self.value = float(self.o.oapi.get_account().portfolio_value)
             except Exception as e:
-                print(f"Alpaca API error: {e}. Fall back to the local API to update value.")
+                logger.error(f"Alpaca API error: {e}. Fall back to the local API to update value.")
                 self.value = self.o.get_value()
             return self.value
         else:
@@ -247,6 +253,7 @@ class AlpacaBroker(with_metaclass(MetaAlpacaBroker, BrokerBase)):
 
     def _fill(self, oref, size, price, ttype, **kwargs):
         order = self.orders[oref]
+        # Todo: process the bracket orders when order is not alive. Refer to oandav20.
         data = order.data
         pos = self.getposition(data, clone=False)
         pprice_orig = pos.price
@@ -292,7 +299,7 @@ class AlpacaBroker(with_metaclass(MetaAlpacaBroker, BrokerBase)):
             # print(f">>>> data datetime when filled: {data.datetime[0]}")
             # pos.update(execsize, price, bt.num2date(data.datetime[0]))
             dt = kwargs['dt'] if 'dt' in kwargs else data.datetime[0]
-            print(f">>>> order {oref} was filled at {dt}.")
+            logger.info(f">>>> order {oref} was filled at {dt}.")
             pos.update(execsize, price, dt)
             # Execute and notify the order
             order.execute(dt, execsize, price,
