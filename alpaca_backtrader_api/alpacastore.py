@@ -6,7 +6,7 @@ import time
 from enum import Enum
 import traceback
 import copy
-
+from typing import Optional
 from datetime import datetime, timedelta, time as dtime
 from dateutil.parser import parse as date_parse
 import time as _time
@@ -373,7 +373,7 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         # poslist = positions.get('positions', [])
         return positions
 
-    def get_granularity(self, timeframe, compression) -> Granularity:
+    def get_granularity(self, timeframe, compression) -> Optional[Granularity]:
         if timeframe == bt.TimeFrame.Ticks:
             return Granularity.Ticks
         elif timeframe == bt.TimeFrame.Minutes:
@@ -519,8 +519,9 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         :param granularity:
         :return:
         """
+        # Todo: use the timezone info from the data params, if none make it utc. Currently assume the input and received the data are based on utc native time.
         calendar = exchange_calendars.get_calendar(name='NYSE')
-        ts_utc = lambda dt: pd.Timestamp(pytz.timezone('UTC').localize(dt, is_dst=None)) if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None else dt
+        ts_utc = lambda dt: pd.to_datetime(pytz.UTC.localize(dt)) if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None else dt.astimezone(pytz.UTC)
         if not dtend:
             dtend = pd.Timestamp.now(tz=NY)
         else:

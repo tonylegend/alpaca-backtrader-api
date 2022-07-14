@@ -9,7 +9,7 @@ from backtrader.feed import DataBase
 from backtrader import date2num, num2date, TimeFrame
 from backtrader.utils.py3 import queue, with_metaclass
 import backtrader as bt
-
+import pytz
 from alpaca_backtrader_api import alpacastore
 
 
@@ -148,6 +148,24 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
 
     _TOFFSET = timedelta()
 
+    # always work with utc timezone aware time for input data
+    def dtinput2utc(self, dt: datetime):
+        if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+            if self._tzinput:
+                dt = self._tzinput.localize(dt).astimezone(pytz.UTC)
+            else:
+                dt = pytz.UTC.localize(dt)
+        else:
+            dt = dt.astimezone(pytz.UTC)
+        return dt
+
+    def dtsetup_num2date_utc(self, ordinal):
+        if self._tz:
+            dt = num2date(ordinal, tz=self._tz).astimezone(pytz.UTC)
+        else:
+            dt = num2date(ordinal, tz=pytz.UTC)
+        return dt
+
     def _timeoffset(self):
         # Effective way to overcome the non-notification?
         return self._TOFFSET
@@ -226,11 +244,13 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
             self.put_notification(self.DELAYED)
             dtend = None
             if self.todate < float('inf'):
-                dtend = num2date(self.todate)
+                # dtend = num2date(self.todate)
+                dtend = self.dtsetup_num2date_utc(self.todate)
 
             dtbegin = None
             if self.fromdate > float('-inf'):
-                dtbegin = num2date(self.fromdate, tz=timezone.utc)
+                # dtbegin = num2date(self.fromdate, tz=timezone.utc)
+                dtbegin = self.dtsetup_num2date_utc(self.fromdate)
 
             self.qhist = self.o.candles(
                 self.p.dataname, dtbegin, dtend,
@@ -280,9 +300,11 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
             if dtcurr > dtstart:
                 if len(self) > 1:
                     # len == 1 ... forwarded for the 1st time
-                    dtbegin = self.datetime.datetime(-1)
+                    # dtbegin = self.datetime.datetime(-1)
+                    dtbegin = self.dtinput2utc(self.datetime.datetime(-1))
                 elif self.fromdate > float('-inf'):
-                    dtbegin = num2date(self.fromdate, tz=timezone.utc)
+                    # dtbegin = num2date(self.fromdate, tz=timezone.utc)
+                    dtbegin = self.dtsetup_num2date_utc(self.fromdate)
                 else:  # 1st bar and no begin set
                     dtbegin = dtstart
                 self.qlive = self.o.candles(
@@ -293,7 +315,8 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
                     includeFirst=False)
                 dtstart = dtbegin
                 # sleep until next call
-                dtnow = datetime.utcnow()
+                # dtnow = datetime.utcnow()
+                dtnow = datetime.now(tz=timezone.utc)
                 dtnext = self._getstarttime(
                     self._timeframe,
                     self._compression,
@@ -309,14 +332,18 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
     def _getstarttime(self, timeframe, compression, dt=None, offset=0):
         '''
         This method will return the start of the period based on current
-        time (or provided time).
+        time (or provided time), a utc native time.
         '''
+        # always work with utc time.
         sessionstart = self.p.sessionstart
         if sessionstart is None:
             # use UTC 22:00 (5:00 pm New York) as default
             sessionstart = time(hour=22, minute=0, second=0)
         if dt is None:
-            dt = datetime.utcnow()
+            # dt = datetime.utcnow()
+            dt = datetime.now(tz=timezone.utc)
+        else:
+            dt = self.dtinput2utc(dt)
         if timeframe == TimeFrame.Seconds:
             dt = dt.replace(
                 second=(dt.second // compression) * compression,
@@ -394,7 +421,7 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
         orig_timeframe = self._timeframe
         orig_compression = self._compression
         # setting up replay configuration
-        super(DataBase, self).replay(**kwargs)
+        super(AlpacaData, self).replay(**kwargs)
         # putting back original timeframe and compression to fetch correct data
         # the replay configuration will still use the correct dataframe and
         # compression for strategy
@@ -483,17 +510,21 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
                 if self._laststatus != self.DELAYED:
                     self.put_notification(self.DELAYED)
 
+
                 dtend = None
                 if len(self) > 1:
                     # len == 1 ... forwarded for the 1st time
-                    dtbegin = self.datetime.datetime(-1).astimezone(timezone.utc)
+                    # dtbegin = self.datetime.datetime(-1).astimezone(timezone.utc)
+                    dtbegin = self.dtinput2utc(self.datetime.datetime(-1))
                 elif self.fromdate > float('-inf'):
-                    dtbegin = num2date(self.fromdate, tz=timezone.utc)
+                    # dtbegin = num2date(self.fromdate, tz=pytz.UTC)
+                    dtbegin = self.dtsetup_num2date_utc(self.fromdate)
                 else:  # 1st bar and no begin set
                     # passing None to fetch max possible in 1 request
                     dtbegin = None
                 if msg:
-                    dtend = pd.Timestamp(msg['time'], unit='ns', tz='UTC')
+                    # dtend = pd.Timestamp(msg['time'], unit='ns', tz='UTC')
+                    dtend = pd.Timestamp(msg['time'], unit='ns', tz=self._tzinput).tz_convert('UTC') if self._tzinput else pd.Timestamp(msg['time'], unit='ns', tz='UTC')
 
                 self.qhist = self.o.candles(
                     self.p.dataname, dtbegin, dtend,
@@ -561,7 +592,9 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
                     return False
 
     def _load_tick(self, msg):
-        dtobj = pd.Timestamp(msg['time'], unit='ns')
+        # dtobj = pd.Timestamp(msg['time'], unit='ns')
+        dtobj = pd.Timestamp(msg['time'], unit='ns').to_pydatetime()
+        dtobj = self.dtinput2utc(dtobj)
         dt = date2num(dtobj)
         if dt <= self.lines.datetime[-1]:
             return False  # time already seen
@@ -585,7 +618,9 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
         return True
 
     def _load_agg(self, msg):
-        dtobj = pd.Timestamp(msg['time'], unit='ns')
+        # dtobj = pd.Timestamp(msg['time'], unit='ns')
+        dtobj = pd.Timestamp(msg['time'], unit='ns').to_pydatetime()
+        dtobj = self.dtinput2utc(dtobj)
         dt = date2num(dtobj)
         if dt <= self.lines.datetime[-1]:
             return False  # time already seen
@@ -610,7 +645,8 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
                 self.p.compression,
                 dtobj,
                 -1) - timedelta(microseconds=100)
-        dt = date2num(dtobj)
+        dtobj = self.dtinput2utc(dtobj)
+        dt = date2num(dtobj)  # keep UTC val
         if dt <= self.lines.datetime[-1]:
             return False  # time already seen
 
@@ -620,6 +656,37 @@ class AlpacaData(with_metaclass(MetaAlpacaData, DataBase)):
         self.lines.openinterest[0] = 0.0
 
         # Put the prices into the bar
+
+        self.lines.open[0] = msg['open']
+        self.lines.high[0] = msg['high']
+        self.lines.low[0] = msg['low']
+        self.lines.close[0] = msg['close']
+
+        return True
+
+    def _load_candle(self, msg):
+        # dtobj = datetime.utcfromtimestamp(float(msg['time']))
+        dtobj = msg['time'].to_pydatetime()
+        if self.p.adjstarttime:
+            # move time to start time of next candle
+            # and subtract 0.1 miliseconds (ensures no
+            # rounding issues, 10 microseconds is minimum)
+            dtobj = self._getstarttime(
+                self.p.timeframe,
+                self.p.compression,
+                dtobj,
+                -1) - timedelta(microseconds=100)
+        dtobj = self.dtinput2utc(dtobj)
+        dt = date2num(dtobj)
+        if dt <= self.l.datetime[-1]:
+            return False  # time already seen
+
+        # common fields
+        self.l.datetime[0] = dt
+        self.l.volume[0] = float(msg['volume'])
+        self.l.openinterest[0] = 0.0
+
+        # put the prices into the bar
 
         self.lines.open[0] = msg['open']
         self.lines.high[0] = msg['high']
