@@ -557,7 +557,7 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         #     dtbegin -= timedelta(days=1)
         if dtbegin > dtend:
             dtbegin = calendar.session_open(calendar.minute_to_past_session(dtend))
-        return dtbegin.astimezone(NY), dtend.astimezone(NY)
+        return dtbegin.astimezone(pytz.timezone(NY)), dtend.astimezone(pytz.timezone(NY))
 
     def get_aggs_from_alpaca(self,
                              dataname,
@@ -941,6 +941,8 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         'pending_new',
         'accepted_for_bidding',
     )
+    # transactions which cancelled orders
+    _X_CANCEL_TRANS = ('canceled',)
 
     def _transaction(self, trans):
         # Invoked from Streaming Events. May actually receive an event for an
@@ -954,10 +956,11 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         oid = trans.order['id']
 
         # check if the transaction response is duplicated.
-        if trans.execution_id in self._orderexecs[oid]:
-            return  # duplicated response and skip the processing.
-        else:
-            self._orderexecs[oid].append(trans.execution_id)
+        if hasattr(trans, 'execution_id'):  # some transactions may not have execution_id e.g. outside the market hours.
+            if trans.execution_id in self._orderexecs[oid]:
+                return  # duplicated response and skip the processing.
+            else:
+                self._orderexecs[oid].append(trans.execution_id)
 
         try:
             oref = self._ordersrev[oid]
@@ -1023,6 +1026,8 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         elif ttype == 'calculated':
             return
 
+        elif ttype in self._X_CANCEL_TRANS:
+            self.broker._cancel(oref)
         elif ttype == 'expired':
             self.broker._expire(oref)
         else:  # default action ... if nothing else
