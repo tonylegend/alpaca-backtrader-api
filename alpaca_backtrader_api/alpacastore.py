@@ -491,14 +491,16 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         # Todo: check if dtbegin and dtend are NY native time or UTC (tz or native) time
         dt_ny = lambda dt: pytz.timezone(NY).localize(dt, is_dst=None) if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None else dt
 
-        cdl = cdl.loc[
-              # pytz.timezone(NY).localize(dtbegin) if
-              # not dtbegin.tzname() else dtbegin:
-              dt_ny(dtbegin):
-              # pytz.timezone(NY).localize(dtend) if
-              # not dtend.tzname() else dtend
-              dt_ny(dtend)
-              ].dropna(subset=['high'])
+        # dtbegin_ny, dtend_ny = dt_ny(dtbegin), dt_ny(dtend)
+        cdl = cdl.query("@dtbegin <= timestamp <= @dtend").dropna(subset=['high'])
+        # cdl = cdl.loc[
+        #       # pytz.timezone(NY).localize(dtbegin) if
+        #       # not dtbegin.tzname() else dtbegin:
+        #       dt_ny(dtbegin):
+        #       # pytz.timezone(NY).localize(dtend) if
+        #       # not dtend.tzname() else dtend
+        #       dt_ny(dtend)
+        #       ].dropna(subset=['high'])
         records = cdl.reset_index().to_dict('records')
         for r in records:
             r['time'] = r['timestamp']
@@ -521,9 +523,10 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         """
         # Todo: use the timezone info from the data params, if none make it utc. Currently assume the input and received the data are based on utc native time.
         calendar = exchange_calendars.get_calendar(name='NYSE')
-        ts_utc = lambda dt: pd.to_datetime(pytz.UTC.localize(dt)) if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None else dt.astimezone(pytz.UTC)
+        ts_utc = lambda dt: pd.to_datetime(pytz.UTC.localize(dt)) if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None else pd.Timestamp(dt).tz_convert(pytz.UTC)
         if not dtend:
-            dtend = pd.Timestamp.now(tz=NY)
+            # dtend = pd.Timestamp.now(tz=NY)
+            dtend = pd.Timestamp.now(tz='UTC')
         else:
             # dtbegin and dtend are UTC native time, even when you set the timezone in datafactory.
             # start and end input to datafactory can be either timezone aware datetime or NY native datetime to be converted to utc.
@@ -534,7 +537,10 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
             dtend = ts_utc(dtend)
         if granularity == Granularity.Minute:
             dtend = calendar.minute_to_trading_minute(dtend.ceil(freq='T'), direction="previous")
-            # while not calendar.is_open_on_minute(dtend.ceil(freq='T')):
+        elif granularity == Granularity.Daily:
+            dtend = calendar.closes[calendar.minute_to_session(dtend, direction='previous')]
+
+        # while not calendar.is_open_on_minute(dtend.ceil(freq='T')):
             #     dtend = dtend.replace(hour=16,
             #                           minute=0,
             #                           second=0,
@@ -555,9 +561,17 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
         #     # if we start the script during market hours we could get this
         #     # situation. this resolves that.
         #     dtbegin -= timedelta(days=1)
-        if dtbegin > dtend:
-            dtbegin = calendar.session_open(calendar.minute_to_past_session(dtend))
-        return dtbegin.astimezone(pytz.timezone(NY)), dtend.astimezone(pytz.timezone(NY))
+        # if dtbegin > dtend:
+        #     dtbegin = calendar.session_open(calendar.minute_to_past_session(dtend))
+        while dtbegin >= dtend:
+            if granularity == Granularity.Daily:
+                dtbegin = calendar.previous_close(dtbegin)
+                # dtbegin -= pd.Timedelta(days=1)
+            else:
+                # dtbegin = calendar.previous_minute(dtbegin)
+                dtbegin -= pd.Timedelta(minutes=1)
+        # return dtbegin.astimezone(pytz.timezone(NY)), dtend.astimezone(pytz.timezone(NY))
+        return dtbegin, dtend
 
     def get_aggs_from_alpaca(self,
                              dataname,
@@ -839,7 +853,10 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
                                 "trailamount when creating StopTrail order")
 
         # anything from the user
-        okwargs.update(order.info)
+        unallowed_keys = ['actions']
+        user_order_info = {k: v for k, v in order.info.items() if k not in unallowed_keys}
+        # okwargs.update(order.info)
+        okwargs.update(user_order_info)
         okwargs.update(**kwargs)
 
         self.q_ordercreate.put((order.ref, okwargs,))
@@ -1139,6 +1156,9 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
                 _, df = download_results.pop()
                 if isinstance(df, pd.DataFrame) and not df.empty:
                     results = pd.concat([results, df])
+            if not results.empty:
+                results = results.dropna()
+                results = results[~results.index.duplicated()].sort_index()
             return results
 
         return asyncio.run(_get_hist_mkt_data(dataname, start, end, granularity, compression))
