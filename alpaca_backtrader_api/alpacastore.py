@@ -853,7 +853,7 @@ class AlpacaStore(with_metaclass(MetaSingleton, object)):
                                 "trailamount when creating StopTrail order")
 
         # anything from the user
-        unallowed_keys = ['actions']
+        unallowed_keys = ['actions', 'rebalance']
         user_order_info = {k: v for k, v in order.info.items() if k not in unallowed_keys}
         # okwargs.update(order.info)
         okwargs.update(user_order_info)
